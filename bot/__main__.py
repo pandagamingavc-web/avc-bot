@@ -1,20 +1,27 @@
-import os
+from __future__ import annotations
+
 import asyncio
+import logging
+import os
+
 from aiohttp import web
 
 from .config import load_config
 from .discord_bot import DiscordBot
-from .telegram_bot import TelegramBot
+from .telegram_bot import TelegramBridge  # <-- ВАЖНО: TelegramBridge, НЕ TelegramBot
 
 
-async def start_web_server() -> None:
-    """
-    Нужен для Render Web Service (чтобы был открыт порт).
-    Render ждёт, что процесс слушает PORT.
-    """
+def setup_logging():
+    logging.basicConfig(
+        level="INFO",
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+
+async def start_web_server():
     app = web.Application()
 
-    async def health(_request: web.Request) -> web.Response:
+    async def health(_):
         return web.Response(text="OK")
 
     app.router.add_get("/", health)
@@ -27,39 +34,49 @@ async def start_web_server() -> None:
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
 
-    # держим сервер запущенным всегда
+    # держим веб-сервер живым
     await asyncio.Event().wait()
 
 
 async def main():
+    setup_logging()
     cfg = load_config()
 
-    async def noop(**kwargs):
-        return None
+    discord_bot: DiscordBot | None = None
 
-    discord = DiscordBot(cfg, tg_bridge_send=noop)
-    telegram = TelegramBot(cfg, discord_bridge_send=noop)
+    # TG -> Discord (мост)
+    async def tg_to_discord(text: str, author: str):
+        if not discord_bot:
+            return
+        if not cfg.bridge_discord_channel_id:
+            return
+        ch = discord_bot.get_channel(cfg.bridge_discord_channel_id)
+        if ch:
+            await ch.send(f"📩 TG {author}: {text}")
 
-    async def tg_send(text: str, author: str = ""):
-        if cfg.bridge_telegram_chat_id:
-            await telegram.app.bot.send_message(
-                chat_id=cfg.bridge_telegram_chat_id,
-                text=f"{author}: {text}",
-            )
+    tg = TelegramBridge(cfg, on_text_from_tg=tg_to_discord)
 
-    async def dc_send(text: str, author: str = ""):
-        if cfg.bridge_discord_channel_id:
-            ch = discord.get_channel(cfg.bridge_discord_channel_id)
-            if ch:
-                await ch.send(f"{author}: {text}")
+    # Discord -> TG (мост)
+    async def discord_to_tg(text: str, author: str):
+        target = cfg.bridge_telegram_chat_id or cfg.telegram_admin_chat_id
+        if not target:
+            return
+        if not tg.app:
+            return
+        await tg.app.bot.send_message(
+            chat_id=int(target),
+            text=f"💬 Discord {author}: {text}",
+        )
 
-    discord.tg_bridge_send = tg_send
-    telegram.discord_bridge_send = dc_send
+    # стартуем TG
+    await tg.start()
+
+    # стартуем Discord
+    discord_bot = DiscordBot(cfg, tg_bridge_send=discord_to_tg)
 
     await asyncio.gather(
-        start_web_server(),                 # <-- ВАЖНО для Render Web Service
-        telegram.start(),
-        discord.start(cfg.discord_token),
+        start_web_server(),
+        discord_bot.start(cfg.discord_token),
     )
 
 
