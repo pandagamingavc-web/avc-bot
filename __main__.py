@@ -3,122 +3,88 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import signal
-from typing import Optional
+from aiohttp import web
 
-from .config import Config
-from .telegram_bot import TelegramBridge
+from .config import load_config
 from .discord_bot import DiscordBot
+from .telegram_bot import TelegramBridge
 
 
-def _setup_logging():
+def setup_logging():
     logging.basicConfig(
         level=os.getenv("LOG_LEVEL", "INFO").upper(),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
 
+async def start_web_server() -> None:
+    """
+    Нужен для Render Web Service (чтобы был открыт порт).
+    """
+    app = web.Application()
+
+    async def health(_request: web.Request) -> web.Response:
+        return web.Response(text="OK")
+
+    app.router.add_get("/", health)
+    app.router.add_get("/health", health)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+
+    port = int(os.environ.get("PORT", "10000"))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+
+    logging.getLogger("web").info("Health server listening on %s", port)
+
+    # держим сервер всегда
+    await asyncio.Event().wait()
+
+
 async def main():
-    _setup_logging()
+    setup_logging()
     log = logging.getLogger("main")
 
-    cfg = Config()
+    cfg = load_config()
 
-    # ---- Telegram bridge (TG -> Discord) ----
-    discord_bot: Optional[DiscordBot] = None
+    # Создадим Discord позже, но подготовим функции мостов заранее
+    discord_bot: DiscordBot | None = None
 
+    # --- TG -> Discord ---
     async def send_to_discord_from_tg(text: str, author: str):
-        """
-        Сюда приходят сообщения из Telegram.
-        Если настроен DISCORD_BRIDGE_CHANNEL_ID — отправим туда.
-        Иначе просто логируем.
-        """
         nonlocal discord_bot
-        channel_id = getattr(cfg, "discord_bridge_channel_id", None) or getattr(cfg, "DISCORD_BRIDGE_CHANNEL_ID", None)
-
+        if not cfg.bridge_discord_channel_id:
+            return
         if not discord_bot or not discord_bot.is_ready():
-            log.info("[TG->Discord] (bot not ready) %s: %s", author, text)
             return
-
-        if not channel_id:
-            log.info("[TG->Discord] (no channel configured) %s: %s", author, text)
-            return
-
-        try:
-            ch = discord_bot.get_channel(int(channel_id))
-            if ch is None:
-                log.warning("[TG->Discord] channel %s not found", channel_id)
-                return
+        ch = discord_bot.get_channel(cfg.bridge_discord_channel_id)
+        if ch:
             await ch.send(f"📩 **TG {author}:** {text}")
-        except Exception:
-            log.exception("Failed to forward TG -> Discord")
 
     tg = TelegramBridge(cfg, on_text_from_tg=send_to_discord_from_tg)
 
-    # ---- Discord bridge (Discord -> TG) ----
+    # --- Discord -> TG (в админ-чат или в bridge чат) ---
     async def send_to_tg_from_discord(text: str, author: str):
-        """
-        Сюда DiscordBot будет слать текст (если у тебя где-то в discord_bot.py вызывается tg_bridge_send).
-        Отправим в TG admin chat (TELEGRAM_ADMIN_CHAT_ID).
-        """
-        try:
-            await tg.send_to_admin(f"💬 Discord {author}: {text}")
-        except Exception:
-            log.exception("Failed to forward Discord -> TG")
+        # если указан BRIDGE_TELEGRAM_CHAT_ID — шлём туда, иначе в TELEGRAM_ADMIN_CHAT_ID
+        target = cfg.bridge_telegram_chat_id or cfg.telegram_admin_chat_id
+        if not target:
+            return
+        if not tg.app:
+            return
+        await tg.app.bot.send_message(chat_id=int(target), text=f"💬 Discord {author}: {text}")
 
-    # ---- Start Telegram (non-blocking polling) ----
+    # Стартуем TG polling (не блокирует)
     await tg.start()
     log.info("Telegram started")
 
-    # ---- Start Discord ----
+    # Стартуем Discord
     discord_bot = DiscordBot(cfg, tg_bridge_send=send_to_tg_from_discord)
 
-    stop_event = asyncio.Event()
-
-    def _request_stop(*_):
-        log.warning("Shutdown requested...")
-        stop_event.set()
-
-    # ловим SIGTERM/SIGINT (Render шлёт SIGTERM при остановке/перезапуске)
-    try:
-        loop = asyncio.get_running_loop()
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            try:
-                loop.add_signal_handler(sig, _request_stop)
-            except NotImplementedError:
-                # Windows / ограничения окружения
-                signal.signal(sig, lambda *_: _request_stop())
-    except Exception:
-        pass
-
-    # Discord запускаем как task
-    discord_task = asyncio.create_task(discord_bot.start(cfg.discord_token), name="discord.start")
-
-    # ждём остановки
-    await stop_event.wait()
-
-    # ---- Graceful shutdown ----
-    log.info("Stopping services...")
-
-    try:
-        await tg.stop()
-    except Exception:
-        log.exception("Telegram stop failed")
-
-    try:
-        await discord_bot.close()
-    except Exception:
-        log.exception("Discord close failed")
-
-    # дождаться задачи discord start (если ещё не упала/не завершилась)
-    try:
-        await asyncio.wait_for(discord_task, timeout=15)
-    except asyncio.TimeoutError:
-        discord_task.cancel()
-    except Exception:
-        pass
-
-    log.info("Stopped. Bye!")
+    await asyncio.gather(
+        start_web_server(),                 # порт для Render
+        discord_bot.start(cfg.discord_token) # discord
+    )
 
 
 if __name__ == "__main__":
