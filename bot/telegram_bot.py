@@ -1,93 +1,119 @@
 from __future__ import annotations
+
+import asyncio
+import logging
+from typing import Callable, Awaitable, Optional
+
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
+
 from .config import Config
-from .keywords import KEYWORD_REPLIES
-import uuid
 
-def _low(s: str) -> str:
-    return (s or "").lower()
 
-def make_ticket_id() -> str:
-    return uuid.uuid4().hex[:8]
+log = logging.getLogger(__name__)
 
-class TelegramBot:
-    def __init__(self, cfg: Config, discord_bridge_send):
+
+class TelegramBridge:
+    """
+    Неблокирующий Telegram polling для совместной работы с Discord в одном asyncio-loop.
+    """
+
+    def __init__(self, cfg: Config, on_text_from_tg: Callable[[str, str], Awaitable[None]]):
         self.cfg = cfg
-        self.discord_bridge_send = discord_bridge_send
-        self.app = Application.builder().token(cfg.telegram_token).build()
+        self.on_text_from_tg = on_text_from_tg  # async (text, author)
+        self.app: Optional[Application] = None
+        self._started = False
 
-        self.app.add_handler(CommandHandler("donate", self._link("donate")))
-        self.app.add_handler(CommandHandler("discord", self._link("discord")))
-        self.app.add_handler(CommandHandler("steam", self._link("steam")))
-        self.app.add_handler(CommandHandler("goals", self._link("goals")))
-        self.app.add_handler(CommandHandler("ticket", self.ticket))
+    async def _cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await update.effective_message.reply_text("✅ Бот жив. Напиши сообщение — отвечу.")
 
-        self.app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, self.welcome))
-        self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.on_text))
-
-        self.ticket_map = {}  # admin_msg_id -> user_chat_id
-
-    def _link(self, which: str):
-        async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-            link = getattr(self.cfg, f"link_{which}", "") or "Ссылка не настроена."
-            await update.message.reply_text(link)
-        return handler
-
-    async def welcome(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not update.message:
+    async def _on_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        msg = update.effective_message
+        if not msg or not msg.text:
             return
-        for m in update.message.new_chat_members or []:
-            await update.message.reply_text(f"👋 Добро пожаловать, {m.full_name}!")
 
-    async def ticket(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not update.message:
-            return
-        text = " ".join(context.args).strip()
-        if not text:
-            return await update.message.reply_text("Напиши: /ticket твоя заявка")
-
-        if not self.cfg.telegram_admin_chat_id:
-            return await update.message.reply_text("Не настроен TELEGRAM_ADMIN_CHAT_ID.")
-
-        tid = make_ticket_id()
+        text = msg.text
         user = update.effective_user
-        user_chat_id = update.effective_chat.id
+        author = (user.full_name if user else "unknown")
 
-        admin_text = (
-            f"🎫 TICKET {tid}\n"
-            f"From: {user.id} {user.full_name}\n"
-            f"Chat: {user_chat_id}\n"
-            f"Text: {text}"
-        )
-        msg = await context.bot.send_message(chat_id=self.cfg.telegram_admin_chat_id, text=admin_text)
-        self.ticket_map[msg.message_id] = user_chat_id
-        await update.message.reply_text(f"✅ Тикет создан: {tid}.")
+        # ЛОГ: чтобы видеть, что реально приходят апдейты
+        log.info("[TG] got message from %s: %s", author, text)
 
-    async def on_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not update.message:
-            return
+        # тестовый ответ в телеге (чтобы сразу понять, что хендлер работает)
+        await msg.reply_text("👍 Принял: " + text[:200])
 
-        # Admin reply-to-ticket -> forward to user
-        if self.cfg.telegram_admin_chat_id and update.effective_chat.id == self.cfg.telegram_admin_chat_id:
-            rt = update.message.reply_to_message
-            if rt and rt.message_id in self.ticket_map:
-                user_chat_id = self.ticket_map[rt.message_id]
-                await context.bot.send_message(chat_id=user_chat_id, text=f"💬 Ответ админа: {update.message.text}")
-                return
+        # если у тебя есть мост в Discord — отправим туда
+        try:
+            await self.on_text_from_tg(text, author)
+        except Exception:
+            log.exception("TG -> Discord bridge failed")
 
-        content = _low(update.message.text)
-        for k, v in KEYWORD_REPLIES.items():
-            if k in content:
-                await update.message.reply_text(v)
-                break
-
-        if self.cfg.bridge_telegram_chat_id and update.effective_chat.id == self.cfg.bridge_telegram_chat_id:
-            if self.discord_bridge_send:
-                await self.discord_bridge_send(text=update.message.text, author=update.effective_user.full_name)
+    async def _on_error(self, update: object, context: ContextTypes.DEFAULT_TYPE):
+        log.exception("Telegram error: %s", context.error)
 
     async def start(self):
+        """
+        Запускаем polling НЕ блокируя loop.
+        """
+        if self._started:
+            return
+        self._started = True
+
+        if not self.cfg.telegram_token:
+            raise RuntimeError("TELEGRAM_TOKEN is empty")
+
+        # IMPORTANT: build() без run_polling()
+        self.app = Application.builder().token(self.cfg.telegram_token).build()
+
+        self.app.add_handler(CommandHandler("start", self._cmd_start))
+        self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._on_text))
+        self.app.add_error_handler(self._on_error)
+
+        # правильный неблокирующий старт
         await self.app.initialize()
         await self.app.start()
-        await self.app.updater.start_polling()
-        print("[Telegram] Started polling")
+
+        # start_polling доступен через app.updater (в PTB 20/21)
+        if not self.app.updater:
+            raise RuntimeError("Telegram Updater is not available (check python-telegram-bot version)")
+
+        await self.app.updater.start_polling(
+            drop_pending_updates=True,
+            allowed_updates=Update.ALL_TYPES,
+        )
+
+        log.info("[Telegram] Started polling (non-blocking)")
+
+    async def stop(self):
+        if not self.app:
+            return
+        try:
+            if self.app.updater:
+                await self.app.updater.stop()
+            await self.app.stop()
+            await self.app.shutdown()
+        finally:
+            self.app = None
+            self._started = False
+
+    async def send_to_admin(self, text: str):
+        """
+        Отправка в TG-админ чат (группа/канал).
+        TELEGRAM_ADMIN_CHAT_ID должен быть -100...
+        """
+        if not self.app:
+            return
+        chat_id = getattr(self.cfg, "telegram_admin_chat_id", None)
+        if not chat_id:
+            log.warning("TELEGRAM_ADMIN_CHAT_ID is not set, cannot send message")
+            return
+        try:
+            await self.app.bot.send_message(chat_id=int(chat_id), text=text[:4000])
+        except Exception:
+            log.exception("Failed to send message to admin chat")
