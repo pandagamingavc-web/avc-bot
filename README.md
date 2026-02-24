@@ -1,26 +1,20 @@
-# AVC Bot (Discord + Telegram)
+# AVC Bot (Discord + Telegram) — Render Worker
 
-Функции:
-- тикеты/заявки (Discord + Telegram)
-- модерация (Discord: ban/timeout/purge + антиспам)
-- приветствие новичков (Discord + Telegram)
-- автоответы по ключевым словам (оба)
-- команды ссылок: /donate /discord /steam /goals (оба)
-- роли по кнопкам (Discord)
-- мост сообщений (Discord канал <-> Telegram чат)
+## Как запустить на Render (без карты)
+1) Залей эти файлы в GitHub репозиторий (в корень).
+2) В Render нажми **New + → Blueprint** и выбери репозиторий.
+   Render сам создаст **Worker** по файлу `render.yaml`.
+3) В Render → Service → Environment добавь переменные:
+   - DISCORD_TOKEN
+   - TELEGRAM_TOKEN
+   - DISCORD_GUILD_ID (ID сервера)
+   - TELEGRAM_ADMIN_CHAT_ID (ID админ-чата)
+   - Остальное по желанию (тикеты/bridge/ссылки)
+4) Нажми Deploy.
 
-## Запуск
-```bash
-python -m venv .venv
-# Win: .venv\Scripts\activate
-# Mac/Linux: source .venv/bin/activate
-pip install -r requirements.txt
+## Команды
+Discord: /ticket /donate /discord /steam /goals + /ban /timeout /purge
+Telegram: /ticket /donate /discord /steam /goals
 
-copy .env.example .env  # Windows
-cp .env.example .env    # Mac/Linux
-python -m bot
-```
-
-## Важно
-1) В `.env` укажи токены и ID.
-2) Для ролей-кнопок открой `bot/discord_bot.py` и заполни `role_ids` в команде `/rolepanel`.
+## Роли по кнопкам (Discord)
+Открой `bot/discord_bot.py` и впиши `role_ids` в команде `/rolepanel`.
