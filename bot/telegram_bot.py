@@ -19,7 +19,7 @@ log = logging.getLogger(__name__)
 
 class TelegramBridge:
     """
-    Telegram polling (non-blocking) для совместной работы с Discord в одном asyncio-loop.
+    Telegram polling (non-blocking) + фильтр чата + команды.
     """
 
     def __init__(self, cfg: Config, on_text_from_tg: Callable[[str, str], Awaitable[None]]):
@@ -31,7 +31,7 @@ class TelegramBridge:
     def _chat_allowed(self, update: Update) -> bool:
         allowed = self.cfg.telegram_allowed_chat_id
         if not allowed:
-            return True  # если не задано — разрешаем везде
+            return True
         chat = update.effective_chat
         if not chat:
             return False
@@ -40,7 +40,7 @@ class TelegramBridge:
     async def _cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self._chat_allowed(update):
             return
-        await update.effective_message.reply_text("✅ Бот жив. Напиши /ping или /id.")
+        await update.effective_message.reply_text("✅ Бот жив. Команды: /ping /id")
 
     async def _cmd_ping(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self._chat_allowed(update):
@@ -70,11 +70,16 @@ class TelegramBridge:
         user = update.effective_user
         author = (user.full_name if user else "unknown")
 
-        # ЛОГ: видно что апдейты доходят
+        # команды не зеркалим
+        if text.startswith("/"):
+            return
+
+        # анти-зацикливание: если это уже от Discord — не шлем обратно
+        if text.startswith("[DC]"):
+            return
+
         log.info("[TG] %s: %s", author, text)
 
-        # НИКАКИХ авто-ответов на каждое сообщение (чтобы не спамил в группе)
-        # Мост в Discord — если у тебя он подключен
         try:
             await self.on_text_from_tg(text, author)
         except Exception:
@@ -84,9 +89,6 @@ class TelegramBridge:
         log.exception("Telegram error: %s", context.error)
 
     async def start(self):
-        """
-        Запускаем polling НЕ блокируя loop.
-        """
         if self._started:
             return
         self._started = True
@@ -94,24 +96,21 @@ class TelegramBridge:
         if not self.cfg.telegram_token:
             raise RuntimeError("TELEGRAM_TOKEN is empty")
 
-        # 1) ВАЖНО: сбрасываем webhook, чтобы не было Conflict getUpdates
+        # сбрасываем webhook (чтобы не было Conflict getUpdates)
         try:
             await Bot(self.cfg.telegram_token).delete_webhook(drop_pending_updates=True)
             log.info("[Telegram] deleteWebhook OK")
         except Exception:
             log.exception("[Telegram] deleteWebhook failed")
 
-        # 2) Application без run_polling()
         self.app = Application.builder().token(self.cfg.telegram_token).build()
 
         self.app.add_handler(CommandHandler("start", self._cmd_start))
         self.app.add_handler(CommandHandler("ping", self._cmd_ping))
         self.app.add_handler(CommandHandler("id", self._cmd_id))
-
         self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._on_text))
         self.app.add_error_handler(self._on_error)
 
-        # 3) Non-blocking start
         await self.app.initialize()
         await self.app.start()
 
@@ -125,6 +124,23 @@ class TelegramBridge:
 
         log.info("[Telegram] Started polling (non-blocking)")
 
+    async def send_to_chat(self, chat_id: int, text: str):
+        if not self.app:
+            return
+        try:
+            await self.app.bot.send_message(chat_id=int(chat_id), text=text[:4000])
+        except Exception:
+            log.exception("Failed to send message to chat")
+
+    async def send_to_admin(self, text: str):
+        if not self.app:
+            return
+        chat_id = getattr(self.cfg, "telegram_admin_chat_id", None)
+        if not chat_id:
+            log.warning("TELEGRAM_ADMIN_CHAT_ID is not set, cannot send message")
+            return
+        await self.send_to_chat(int(chat_id), text)
+
     async def stop(self):
         if not self.app:
             return
@@ -136,19 +152,3 @@ class TelegramBridge:
         finally:
             self.app = None
             self._started = False
-
-    async def send_to_admin(self, text: str):
-        """
-        Отправка в TG-админ чат (группа/канал).
-        TELEGRAM_ADMIN_CHAT_ID должен быть -100...
-        """
-        if not self.app:
-            return
-        chat_id = getattr(self.cfg, "telegram_admin_chat_id", None)
-        if not chat_id:
-            log.warning("TELEGRAM_ADMIN_CHAT_ID is not set, cannot send message")
-            return
-        try:
-            await self.app.bot.send_message(chat_id=int(chat_id), text=text[:4000])
-        except Exception:
-            log.exception("Failed to send message to admin chat")
