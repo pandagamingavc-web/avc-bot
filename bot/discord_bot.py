@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import logging
-from typing import Callable, Awaitable, Optional
+from dataclasses import dataclass
+from typing import Optional
 
 import discord
 
@@ -10,89 +11,84 @@ from .config import Config
 log = logging.getLogger(__name__)
 
 
-class DiscordBridge:
-    def __init__(self, cfg: Config, on_text_from_discord: Callable[[str, str], Awaitable[None]]):
+class DiscordBot:
+    def __init__(self, cfg: Config):
         self.cfg = cfg
-        self.on_text_from_discord = on_text_from_discord  # async(text, author)
+
         intents = discord.Intents.default()
-        intents.message_content = True  # нужно чтобы читать текст сообщений
+        intents.message_content = True  # важно для чтения сообщений
         intents.guilds = True
         intents.messages = True
 
         self.client = discord.Client(intents=intents)
-        self._started = False
+
+        self._bridge_channel: Optional[discord.TextChannel] = None
+        self._tg_send_func = None  # будет задано из __main__.py
 
         @self.client.event
         async def on_ready():
             log.info("[Discord] Logged in as %s (id=%s)", self.client.user, self.client.user.id)
+            await self._resolve_bridge_channel()
 
         @self.client.event
         async def on_message(message: discord.Message):
-            # игнорим ботов (и себя)
             if message.author.bot:
                 return
 
-            # если указан мост-канал — слушаем только его
-            if self.cfg.bridge_discord_channel_id:
-                if message.channel.id != int(self.cfg.bridge_discord_channel_id):
-                    return
+            # если не настроен мост в TG — просто выходим
+            if not self._tg_send_func:
+                return
 
-            text = message.content or ""
-            if not text.strip():
+            # ждём пока канал будет найден
+            if not self._bridge_channel:
+                await self._resolve_bridge_channel()
+
+            # только из нужного канала
+            if self._bridge_channel and message.channel.id != self._bridge_channel.id:
+                return
+
+            text = message.content.strip()
+            if not text:
                 return
 
             author = message.author.display_name
-            log.info("[DC] got message from %s: %s", author, text)
+            log.info("[Discord->TG] %s: %s", author, text)
 
             try:
-                await self.on_text_from_discord(text, author)
+                await self._tg_send_func(f"💬 Discord | {author}:\n{text}")
             except Exception:
-                log.exception("Discord -> TG bridge failed")
+                log.exception("Failed to send Discord message to Telegram")
+
+    def set_telegram_sender(self, tg_send_func):
+        """tg_send_func: async (text: str) -> None"""
+        self._tg_send_func = tg_send_func
+
+    async def _resolve_bridge_channel(self):
+        chan_id = getattr(self.cfg, "bridge_discord_channel_id", None)
+        if not chan_id:
+            log.warning("BRIDGE_DISCORD_CHANNEL_ID is not set")
+            return
+
+        channel = self.client.get_channel(int(chan_id))
+        if channel is None:
+            # иногда нужно дождаться кеша
+            await self.client.wait_until_ready()
+            channel = self.client.get_channel(int(chan_id))
+
+        if not isinstance(channel, discord.abc.Messageable):
+            log.warning("Bridge channel not found or not messageable: %s", chan_id)
+            return
+
+        self._bridge_channel = channel  # type: ignore
+        log.info("[Discord] Bridge channel resolved: %s", chan_id)
+
+    async def send_to_bridge_channel(self, text: str):
+        if not self._bridge_channel:
+            await self._resolve_bridge_channel()
+        if not self._bridge_channel:
+            log.warning("[Bridge] Discord channel not available")
+            return
+        await self._bridge_channel.send(text[:1900])
 
     async def start(self):
-        if self._started:
-            return
-        self._started = True
-
-        if not self.cfg.discord_token:
-            raise RuntimeError("DISCORD_TOKEN missing")
-
         await self.client.start(self.cfg.discord_token)
-
-    async def stop(self):
-        try:
-            await self.client.close()
-        finally:
-            self._started = False
-
-    async def send_to_bridge_channel(self, text: str) -> bool:
-        """
-        Отправляет сообщение в Discord канал BRIDGE_DISCORD_CHANNEL_ID
-        Возвращает True если отправили, иначе False.
-        """
-        ch_id = self.cfg.bridge_discord_channel_id
-        if not ch_id:
-            log.warning("[Bridge] BRIDGE_DISCORD_CHANNEL_ID is not set")
-            return False
-
-        ch_id = int(ch_id)
-
-        # 1) пробуем из кэша
-        channel = self.client.get_channel(ch_id)
-
-        # 2) если не нашли — fetch (самое важное!)
-        if channel is None:
-            try:
-                channel = await self.client.fetch_channel(ch_id)
-            except Exception:
-                log.exception("[Bridge] Cannot fetch Discord channel id=%s", ch_id)
-                return False
-
-        # 3) отправляем
-        try:
-            await channel.send(text[:1900])
-            log.info("[Bridge] Sent to Discord channel %s OK", ch_id)
-            return True
-        except Exception:
-            log.exception("[Bridge] Failed to send message to Discord channel %s", ch_id)
-            return False
