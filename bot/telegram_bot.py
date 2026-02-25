@@ -29,12 +29,21 @@ class TelegramBridge:
         self._started = False
 
     async def _cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        msg = update.effective_message
-        if not msg:
-            return
-        await msg.reply_text("✅ Бот жив. Напиши любое сообщение — отвечу.")
+        await update.effective_message.reply_text("✅ Бот жив. Напиши любое сообщение — отвечу.")
 
-    async def _on_any_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def _cmd_id(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        chat = update.effective_chat
+        user = update.effective_user
+        chat_id = chat.id if chat else None
+        user_id = user.id if user else None
+        title = getattr(chat, "title", None)
+        await update.effective_message.reply_text(
+            f"🆔 chat_id: {chat_id}\n"
+            f"👤 user_id: {user_id}\n"
+            f"📌 chat_title: {title or '—'}"
+        )
+
+    async def _on_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg = update.effective_message
         if not msg or not msg.text:
             return
@@ -45,10 +54,10 @@ class TelegramBridge:
 
         log.info("[TG] got message from %s: %s", author, text)
 
-        # Ответ в телеге — чтобы 100% видеть что хендлер работает
+        # тестовый ответ (чтобы сразу видеть что бот жив)
         await msg.reply_text("👍 Принял: " + text[:200])
 
-        # Мост в Discord (если подключён)
+        # если есть мост в Discord — отправим туда
         try:
             await self.on_text_from_tg(text, author)
         except Exception:
@@ -67,12 +76,9 @@ class TelegramBridge:
 
         self.app = Application.builder().token(self.cfg.telegram_token).build()
 
-        # /start
         self.app.add_handler(CommandHandler("start", self._cmd_start))
-
-        # любые текстовые сообщения (включая команды — для теста!)
-        self.app.add_handler(MessageHandler(filters.TEXT, self._on_any_text))
-
+        self.app.add_handler(CommandHandler("id", self._cmd_id))
+        self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._on_text))
         self.app.add_error_handler(self._on_error)
 
         await self.app.initialize()
@@ -81,8 +87,10 @@ class TelegramBridge:
         if not self.app.updater:
             raise RuntimeError("Telegram Updater is not available (check python-telegram-bot version)")
 
-        # ВАЖНО: без drop_pending_updates и без allowed_updates
-        await self.app.updater.start_polling()
+        await self.app.updater.start_polling(
+            drop_pending_updates=True,
+            allowed_updates=Update.ALL_TYPES,
+        )
 
         log.info("[Telegram] Started polling (non-blocking)")
 
@@ -99,6 +107,10 @@ class TelegramBridge:
             self._started = False
 
     async def send_to_admin(self, text: str):
+        """
+        Отправка в TG-админ чат (группа/канал).
+        TELEGRAM_ADMIN_CHAT_ID должен быть -100...
+        """
         if not self.app:
             return
         chat_id = getattr(self.cfg, "telegram_admin_chat_id", None)
