@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import logging
 from typing import Callable, Awaitable, Optional
 
@@ -14,7 +13,6 @@ from telegram.ext import (
 )
 
 from .config import Config
-
 
 log = logging.getLogger(__name__)
 
@@ -31,9 +29,12 @@ class TelegramBridge:
         self._started = False
 
     async def _cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.effective_message.reply_text("✅ Бот жив. Напиши сообщение — отвечу.")
+        msg = update.effective_message
+        if not msg:
+            return
+        await msg.reply_text("✅ Бот жив. Напиши любое сообщение — отвечу.")
 
-    async def _on_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def _on_any_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg = update.effective_message
         if not msg or not msg.text:
             return
@@ -42,13 +43,12 @@ class TelegramBridge:
         user = update.effective_user
         author = (user.full_name if user else "unknown")
 
-        # ЛОГ: чтобы видеть, что реально приходят апдейты
         log.info("[TG] got message from %s: %s", author, text)
 
-        # тестовый ответ в телеге (чтобы сразу понять, что хендлер работает)
+        # Ответ в телеге — чтобы 100% видеть что хендлер работает
         await msg.reply_text("👍 Принял: " + text[:200])
 
-        # если у тебя есть мост в Discord — отправим туда
+        # Мост в Discord (если подключён)
         try:
             await self.on_text_from_tg(text, author)
         except Exception:
@@ -58,9 +58,6 @@ class TelegramBridge:
         log.exception("Telegram error: %s", context.error)
 
     async def start(self):
-        """
-        Запускаем polling НЕ блокируя loop.
-        """
         if self._started:
             return
         self._started = True
@@ -68,25 +65,24 @@ class TelegramBridge:
         if not self.cfg.telegram_token:
             raise RuntimeError("TELEGRAM_TOKEN is empty")
 
-        # IMPORTANT: build() без run_polling()
         self.app = Application.builder().token(self.cfg.telegram_token).build()
 
+        # /start
         self.app.add_handler(CommandHandler("start", self._cmd_start))
-        self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._on_text))
+
+        # любые текстовые сообщения (включая команды — для теста!)
+        self.app.add_handler(MessageHandler(filters.TEXT, self._on_any_text))
+
         self.app.add_error_handler(self._on_error)
 
-        # правильный неблокирующий старт
         await self.app.initialize()
         await self.app.start()
 
-        # start_polling доступен через app.updater (в PTB 20/21)
         if not self.app.updater:
             raise RuntimeError("Telegram Updater is not available (check python-telegram-bot version)")
 
-        await self.app.updater.start_polling(
-            drop_pending_updates=True,
-            allowed_updates=Update.ALL_TYPES,
-        )
+        # ВАЖНО: без drop_pending_updates и без allowed_updates
+        await self.app.updater.start_polling()
 
         log.info("[Telegram] Started polling (non-blocking)")
 
@@ -103,10 +99,6 @@ class TelegramBridge:
             self._started = False
 
     async def send_to_admin(self, text: str):
-        """
-        Отправка в TG-админ чат (группа/канал).
-        TELEGRAM_ADMIN_CHAT_ID должен быть -100...
-        """
         if not self.app:
             return
         chat_id = getattr(self.cfg, "telegram_admin_chat_id", None)
