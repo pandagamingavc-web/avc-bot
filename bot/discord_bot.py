@@ -1,103 +1,82 @@
 from __future__ import annotations
 
+import logging
+from typing import Optional
+
 import discord
-from discord.ext import commands
 
 from .config import Config
-from .shared import SpamGate
-from .keywords import KEYWORD_REPLIES
+
+log = logging.getLogger(__name__)
 
 
-def _low(s: str) -> str:
-    return (s or "").lower()
-
-
-class RolePanelView(discord.ui.View):
-    def __init__(self, role_ids: list[int]):
-        super().__init__(timeout=None)
-        for rid in role_ids:
-            self.add_item(RoleButton(rid))
-
-
-class RoleButton(discord.ui.Button):
-    def __init__(self, role_id: int):
-        super().__init__(
-            style=discord.ButtonStyle.secondary,
-            label=f"Role {role_id}",
-            custom_id=f"rolebtn:{role_id}",
-        )
-        self.role_id = role_id
-
-    async def callback(self, interaction: discord.Interaction):
-        if not interaction.guild or not isinstance(interaction.user, discord.Member):
-            return await interaction.response.send_message("Только на сервере.", ephemeral=True)
-
-        role = interaction.guild.get_role(self.role_id)
-        if role is None:
-            return await interaction.response.send_message("Роль не найдена.", ephemeral=True)
-
-        member: discord.Member = interaction.user
-        if role in member.roles:
-            await member.remove_roles(role, reason="Role toggle")
-            await interaction.response.send_message(f"Роль снята: {role.name}", ephemeral=True)
-        else:
-            await member.add_roles(role, reason="Role toggle")
-            await interaction.response.send_message(f"Роль выдана: {role.name}", ephemeral=True)
-
-
-class DiscordBot(commands.Bot):
-    def __init__(self, cfg: Config, tg_bridge_send):
-        intents = discord.Intents.default()
-        intents.members = True
-        intents.message_content = True  # нужно включить Message Content Intent в Dev Portal, если используешь сообщения
-        super().__init__(command_prefix="!", intents=intents)
-
+class DiscordBot:
+    def __init__(self, cfg: Config, tg_bridge=None):
         self.cfg = cfg
-        self.spam = SpamGate(cfg.spam_max_msgs, cfg.spam_window_sec)
-        self.tg_bridge_send = tg_bridge_send  # async (text, author)
+        self.tg_bridge = tg_bridge  # TelegramBridge (может быть None)
 
-    async def setup_hook(self):
-        # ВАЖНО: /команды будут зарегистрированы только в этом guild (быстро обновляются)
-        guild = discord.Object(id=self.cfg.discord_guild_id)
+        intents = discord.Intents.default()
+        intents.guilds = True
+        intents.messages = True
+        intents.message_content = True  # нужен включенный intent в Dev Portal
 
-        @self.tree.command(guild=guild, name="donate", description="Ссылка на донат")
-        async def donate(interaction: discord.Interaction):
-            await interaction.response.send_message(self.cfg.link_donate or "Ссылка не настроена.")
+        self.client = discord.Client(intents=intents)
 
-        @self.tree.command(guild=guild, name="discord", description="Ссылка на Discord")
-        async def discord_link(interaction: discord.Interaction):
-            await interaction.response.send_message(self.cfg.link_discord or "Ссылка не настроена.")
+        @self.client.event
+        async def on_ready():
+            log.info("[Discord] Logged in as %s (id=%s)", self.client.user, self.client.user.id)
 
-        @self.tree.command(guild=guild, name="steam", description="Ссылка на Steam")
-        async def steam(interaction: discord.Interaction):
-            await interaction.response.send_message(self.cfg.link_steam or "Ссылка не настроена.")
+        @self.client.event
+        async def on_message(message: discord.Message):
+            try:
+                # игнорим свои сообщения
+                if message.author.bot:
+                    return
 
-        # Синхронизация слэш-команд в конкретный сервер
-        await self.tree.sync(guild=guild)
+                # если задан мост-канал, слушаем только его
+                bridge_ch = self.cfg.bridge_discord_channel_id
+                if bridge_ch and message.channel.id != int(bridge_ch):
+                    return
 
-    async def on_ready(self):
-        print(f"[Discord] Logged in as {self.user} (id={self.user.id})")
+                # пустые / без текста
+                if not message.content:
+                    return
 
-    async def on_message(self, message: discord.Message):
-        # игнор ботов и личек
-        if message.author.bot or message.guild is None:
+                text = message.content.strip()
+
+                # команды не зеркалим
+                if text.startswith("/"):
+                    return
+
+                # анти-зацикливание: если это уже от TG — не шлем обратно
+                if text.startswith("[TG]"):
+                    return
+
+                author = message.author.display_name
+                log.info("[DC] %s: %s", author, text)
+
+                # отправляем в TG (в мост-чат)
+                if self.tg_bridge and self.cfg.bridge_telegram_chat_id:
+                    await self.tg_bridge.send_to_chat(int(self.cfg.bridge_telegram_chat_id), f"[DC] {author}: {text}")
+
+            except Exception:
+                log.exception("on_message failed")
+
+    async def send_to_bridge_channel(self, text: str):
+        ch_id = self.cfg.bridge_discord_channel_id
+        if not ch_id:
             return
+        channel = self.client.get_channel(int(ch_id))
+        if channel is None:
+            try:
+                channel = await self.client.fetch_channel(int(ch_id))
+            except Exception:
+                log.exception("Failed to fetch Discord bridge channel")
+                return
+        try:
+            await channel.send(text[:1900])
+        except Exception:
+            log.exception("Failed to send message to Discord channel")
 
-        # антиспам
-        if self.spam.hit(str(message.author.id)):
-            return
-
-        text = message.content or ""
-        low = _low(text)
-
-        # авто-ответы по ключевым словам
-        for key, reply in KEYWORD_REPLIES.items():
-            if key in low:
-                try:
-                    await message.channel.send(reply)
-                except Exception:
-                    pass
-                break
-
-        # обязательно, чтобы работали префикс-команды (если есть)
-        await self.process_commands(message)
+    async def start(self):
+        await self.client.start(self.cfg.discord_token)
