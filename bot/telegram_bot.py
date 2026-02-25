@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from typing import Callable, Awaitable, Optional
 
-from telegram import Update
+from telegram import Update, Bot
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -19,7 +19,7 @@ log = logging.getLogger(__name__)
 
 class TelegramBridge:
     """
-    Неблокирующий Telegram polling для совместной работы с Discord в одном asyncio-loop.
+    Telegram polling (non-blocking) для совместной работы с Discord в одном asyncio-loop.
     """
 
     def __init__(self, cfg: Config, on_text_from_tg: Callable[[str, str], Awaitable[None]]):
@@ -28,36 +28,53 @@ class TelegramBridge:
         self.app: Optional[Application] = None
         self._started = False
 
+    def _chat_allowed(self, update: Update) -> bool:
+        allowed = self.cfg.telegram_allowed_chat_id
+        if not allowed:
+            return True  # если не задано — разрешаем везде
+        chat = update.effective_chat
+        if not chat:
+            return False
+        return int(chat.id) == int(allowed)
+
     async def _cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.effective_message.reply_text("✅ Бот жив. Напиши любое сообщение — отвечу.")
+        if not self._chat_allowed(update):
+            return
+        await update.effective_message.reply_text("✅ Бот жив. Напиши /ping или /id.")
+
+    async def _cmd_ping(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self._chat_allowed(update):
+            return
+        await update.effective_message.reply_text("🏓 Pong")
 
     async def _cmd_id(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat = update.effective_chat
         user = update.effective_user
-        chat_id = chat.id if chat else None
-        user_id = user.id if user else None
-        title = getattr(chat, "title", None)
+        if not chat:
+            return
         await update.effective_message.reply_text(
-            f"🆔 chat_id: {chat_id}\n"
-            f"👤 user_id: {user_id}\n"
-            f"📌 chat_title: {title or '—'}"
+            f"🆔 chat_id: {chat.id}\n"
+            f"👤 user_id: {user.id if user else 'unknown'}\n"
+            f"📌 chat_title: {chat.title if getattr(chat, 'title', None) else 'private'}"
         )
 
     async def _on_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self._chat_allowed(update):
+            return
+
         msg = update.effective_message
         if not msg or not msg.text:
             return
 
-        text = msg.text
+        text = msg.text.strip()
         user = update.effective_user
         author = (user.full_name if user else "unknown")
 
-        log.info("[TG] got message from %s: %s", author, text)
+        # ЛОГ: видно что апдейты доходят
+        log.info("[TG] %s: %s", author, text)
 
-        # тестовый ответ (чтобы сразу видеть что бот жив)
-        await msg.reply_text("👍 Принял: " + text[:200])
-
-        # если есть мост в Discord — отправим туда
+        # НИКАКИХ авто-ответов на каждое сообщение (чтобы не спамил в группе)
+        # Мост в Discord — если у тебя он подключен
         try:
             await self.on_text_from_tg(text, author)
         except Exception:
@@ -67,6 +84,9 @@ class TelegramBridge:
         log.exception("Telegram error: %s", context.error)
 
     async def start(self):
+        """
+        Запускаем polling НЕ блокируя loop.
+        """
         if self._started:
             return
         self._started = True
@@ -74,13 +94,24 @@ class TelegramBridge:
         if not self.cfg.telegram_token:
             raise RuntimeError("TELEGRAM_TOKEN is empty")
 
+        # 1) ВАЖНО: сбрасываем webhook, чтобы не было Conflict getUpdates
+        try:
+            await Bot(self.cfg.telegram_token).delete_webhook(drop_pending_updates=True)
+            log.info("[Telegram] deleteWebhook OK")
+        except Exception:
+            log.exception("[Telegram] deleteWebhook failed")
+
+        # 2) Application без run_polling()
         self.app = Application.builder().token(self.cfg.telegram_token).build()
 
         self.app.add_handler(CommandHandler("start", self._cmd_start))
+        self.app.add_handler(CommandHandler("ping", self._cmd_ping))
         self.app.add_handler(CommandHandler("id", self._cmd_id))
+
         self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._on_text))
         self.app.add_error_handler(self._on_error)
 
+        # 3) Non-blocking start
         await self.app.initialize()
         await self.app.start()
 
