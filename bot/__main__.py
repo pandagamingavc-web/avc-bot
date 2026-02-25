@@ -9,6 +9,7 @@ from aiohttp import web
 from .config import load_config
 from .discord_bot import DiscordBot
 from .telegram_bot import TelegramBridge
+from .scheduler import Scheduler
 
 
 logging.basicConfig(
@@ -57,10 +58,18 @@ async def main():
 
     discord_bot.set_telegram_sender(discord_to_tg)
 
+    # Планировщик: раз в час (3600 сек) постит в тот же TG и тот же Discord
+    scheduler = Scheduler(
+        every_seconds=int(os.getenv("SCHED_EVERY_SECONDS", "3600")),
+        send_to_tg=tg_bot.send_to_admin,
+        send_to_discord=discord_bot.send_to_bridge_channel,
+    )
+
     await asyncio.gather(
         _health_server(),
         discord_bot.start(),
         tg_bot.start(),
+        scheduler.start(),
     )
 
 
